@@ -1123,10 +1123,11 @@ class GetItemTests(torch._dynamo.test_case.TestCase):
             try:
                 list(IterNoNext())
             except TypeError as exc:
-                return str(exc) == "iter() returned non-iterator of type 'IterNoNext'"
-            return False
+                return str(exc)
 
-        self.assertEqual(fn(), self._compile(fn))
+        out = self._compile(fn)
+        self.assertTrue(type(out) is str)
+        self.assertEqual(fn(), out)
 
     def test_list_constructor_rejects_keywords(self):
         def fn():
@@ -1195,10 +1196,12 @@ class GetItemTests(torch._dynamo.test_case.TestCase):
             try:
                 tuple(IterNoNext())
             except TypeError as exc:
-                return str(exc) == "iter() returned non-iterator of type 'IterNoNext'"
+                return str(exc)
             return False
 
-        self.assertEqual(fn(), self._compile(fn))
+        out = self._compile(fn)
+        self.assertTrue(type(out) is str)
+        self.assertEqual(fn(), out)
 
     def test_tuple_constructor_rejects_keywords(self):
         def fn():
