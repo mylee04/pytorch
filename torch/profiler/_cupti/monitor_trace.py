@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
+import bisect
 import gzip
 import json
 import math
@@ -214,6 +215,85 @@ _GRAPH_DEP_FLOW_ID_BASE = (
 )  # keep node->node arrow flow ids clear of correlation ids
 
 
+def _repair_replay_correlations(
+    corr: list[int],
+    gnid: list[int],
+    start_ns: list[int],
+    end_ns: list[int],
+    graph_deps: dict[int, list[int]],
+) -> list[int]:
+    """Give each correlationId-0 graphed row the correlationId of the replay it ran in.
+
+    CUPTI reports correlationId 0 for a CUDA-graph host node on every replay after the first
+    (it keeps the launch's correlationId only the first time), so grouping by correlationId
+    alone collapses those rows into one bucket and orphans them from the replay whose nodes
+    they must draw arrows to.
+
+    A graph node is bracketed by its neighbours in the DAG: it runs after its dependencies and
+    its dependents run after it. So it ran in the same replay as the dependency that most
+    recently finished before it started, or -- for a graph root, which has no dependency to
+    inherit from -- as the dependent that started first after it ended. Replays of a graph are
+    serialized, so neither neighbour's own replays can straddle: only the current one falls in
+    that gap.
+
+    A row with no neighbour row in this window keeps correlationId 0 rather than being guessed:
+    either its replay straddles the export boundary, or the node is isolated in the recorded
+    DAG -- and an isolated node has neither an incoming nor an outgoing arrow to draw, so its
+    replay does not matter. Returns ``corr`` unchanged when there is nothing to repair.
+    """
+    orphans: dict[int, list[int]] = {}
+    for i, c in enumerate(corr):
+        if not c and gnid[i]:
+            orphans.setdefault(gnid[i], []).append(i)
+    if not orphans or not graph_deps:
+        return corr
+    # Every correlated run of each node: (start, end, correlationId) per replay it appears in.
+    runs: dict[int, list[tuple[int, int, int]]] = {}
+    for i, c in enumerate(corr):
+        if c and gnid[i]:
+            runs.setdefault(gnid[i], []).append((start_ns[i], end_ns[i], c))
+    out = list(corr)
+    dependents: dict[int, list[int]] | None = None
+    # Per orphaned NODE (not per row): its neighbours' runs, sorted once so each of its rows is
+    # a binary search rather than a rescan -- a graph replayed r times in one window has r - 1
+    # orphaned rows per host node, which rescanning makes quadratic in r.
+    for node, rows in orphans.items():
+        ends = sorted(
+            (run[1], run[2])
+            for pred in graph_deps.get(node, ())
+            for run in runs.get(pred, ())
+        )
+        if ends:
+            keys = [e for e, _ in ends]
+            for i in rows:
+                # latest dependency that finished before this row started
+                j = bisect.bisect_right(keys, start_ns[i]) - 1
+                if j >= 0:
+                    out[i] = ends[j][1]
+            continue
+        # A graph root has no dependency to inherit from, so use the other side. Reversing the
+        # edges costs a pass over every edge in the window, so it happens only once and only if
+        # some root actually needs it (a host node with dependencies never gets here).
+        if dependents is None:
+            dependents = {}
+            for succ, preds in graph_deps.items():
+                for pred in preds:
+                    if pred in orphans:
+                        dependents.setdefault(pred, []).append(succ)
+        starts = sorted(
+            (run[0], run[2])
+            for dep in dependents.get(node, ())
+            for run in runs.get(dep, ())
+        )
+        keys = [s for s, _ in starts]
+        for i in rows:
+            # earliest dependent that started after this row ended
+            j = bisect.bisect_left(keys, end_ns[i])
+            if j < len(starts):
+                out[i] = starts[j][1]
+    return out
+
+
 def _graph_dependency_flow_events(
     node_rows: list[tuple[int, int, int, int, int, int]],
     graph_deps: dict[int, list[int]],
@@ -227,6 +307,11 @@ def _graph_dependency_flow_events(
     cross replays; each edge is one flow from the predecessor's end to the successor's start.
     Empty without deps.
 
+    Host-node records carry correlationId 0 on every replay after the first (a CUPTI limitation),
+    which would collapse all their replays into one bucket and orphan them from their per-replay
+    neighbors. :func:`_repair_replay_correlations` restores each row's replay before grouping
+    (the inner map is keyed by graph_node_id), so its arrows connect on every replay.
+
     NOTE: under cross-stream clock skew the recorded predecessor end can land after the successor
     start, and chrome/Perfetto JSON flows cannot render backwards in time, so such an arrow may
     misrender (or bind to the wrong slice when spans overlap on one lane). The .pftrace export
@@ -234,8 +319,15 @@ def _graph_dependency_flow_events(
     renders them correctly regardless -- prefer it when dependency arrows matter."""
     if not graph_deps:
         return []
+    repaired = _repair_replay_correlations(
+        [r[0] for r in node_rows],
+        [r[1] for r in node_rows],
+        [r[4] for r in node_rows],
+        [r[5] for r in node_rows],
+        graph_deps,
+    )
     by_corr: dict[int, dict[int, tuple[int, int, int, int]]] = {}
-    for corr, gnid, dev, tid, start_ns, end_ns in node_rows:
+    for corr, (_c, gnid, dev, tid, start_ns, end_ns) in zip(repaired, node_rows):
         by_corr.setdefault(corr, {})[gnid] = (dev, tid, start_ns, end_ns)
     events: list[dict[str, object]] = []
     fid = _GRAPH_DEP_FLOW_ID_BASE
@@ -368,7 +460,13 @@ def _trace_window_entries(
     # Each kind builds X events from one dict literal per row over the bulk-converted
     # columns; graph-id/node and annotation keys (absent for eager kernels) are patched on
     # only when the column carries them.
-    for ks in ("kernel", "gpu_memcpy", "gpu_memset", "graph_event_node"):
+    for ks in (
+        "kernel",
+        "gpu_memcpy",
+        "gpu_memset",
+        "graph_event_node",
+        "graph_host_node",
+    ):
         c = _col(ks)
         if c is None:
             continue
@@ -516,6 +614,33 @@ def _trace_window_entries(
                 }
                 for i in range(n)
             ]
+        else:
+            # graph_host_node: a CPU callback run as a CUDA-graph node. Rendered on the
+            # waiting stream's lane like the other graphed ops; graph id / node / annotation
+            # and the recorded callback name/address are patched on below (host nodes always
+            # carry a graph_node_id).
+            pid_l = c["process_id"].tolist()
+            htid_l = c["thread_id"].tolist()
+            events = [
+                {
+                    "ph": "X",
+                    "cat": "graph_host_node",
+                    "name": "HostNode",
+                    "pid": dev_l[i],
+                    "tid": tid_l[i],
+                    "ts": ts_l[i],
+                    "dur": dur_l[i],
+                    "args": {
+                        "device": dev_l[i],
+                        "context": ctx_l[i],
+                        "stream": str_l[i],
+                        "correlation": corr_l[i],
+                        "host process": pid_l[i],
+                        "host thread": htid_l[i],
+                    },
+                }
+                for i in range(n)
+            ]
         # Graph ids, annotations, and the comms metadata blob are absent for eager kernels;
         # patch them on only when the column has any. The metadata blob (collective
         # descriptor JSON) is spread into args so its fields show up in the chrome trace.
@@ -524,6 +649,12 @@ def _trace_window_entries(
         ann_l = c["annotation"].tolist()
         meta_col = c.get("metadata")
         meta_l = meta_col.tolist() if meta_col is not None else None
+        # Host-node callback name/address (resolved at graph instantiate; the CUPTI record
+        # carries no fn field). Present only on the graph_host_node column group.
+        fn_col = c.get("host_fn")
+        fn_l = fn_col.tolist() if fn_col is not None else None
+        addr_col = c.get("host_fn_addr")
+        addr_l = addr_col.tolist() if addr_col is not None else None
         # Pluggable lane assignment: a graph lane resolver (if installed) supplies per-op
         # (logical_lane, lane_name) columns; a graphed op whose logical lane differs from
         # its CUDA stream is moved onto that lane below. CUPTI reports graph-replay ops on
@@ -548,6 +679,7 @@ def _trace_window_entries(
             or any(ann_l)  # any non-empty annotation (None / empty skip)
             or meta_l is not None
             or lane_l is not None
+            or fn_l is not None
         ):
             gid_l = gid.tolist()
             gnid_l = gnid.tolist()
@@ -565,6 +697,11 @@ def _trace_window_entries(
                     _annotation_to_args(a, meta_l[i])
                 if ev_events is not None and gnid_l[i] in ev_events:
                     a["cuda event"] = hex(ev_events[gnid_l[i]])
+                if fn_l is not None and fn_l[i]:
+                    a["host fn"] = fn_l[i]
+                    ev["name"] = f"HostNode: {fn_l[i]}"
+                if addr_l is not None and addr_l[i]:
+                    a["host fn addr"] = hex(addr_l[i])
                 if gnid_l[i] and lane_l is not None and lane_l[i] != str_l[i]:
                     lane_id = lane_l[i]
                     lane = _export_tid(lane_id)
