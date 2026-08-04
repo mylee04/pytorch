@@ -1507,7 +1507,13 @@ bool gemm_and_bias(
     const Dtype* bias,
     C_Dtype* result_ptr,
     int64_t result_ld,
-    GEMMAndBiasActivationEpilogue activation) {
+    GEMMAndBiasActivationEpilogue activation,
+    const C_Dtype* c_ptr,
+    int64_t c_ld,
+    std::optional<at::opmath_type<Dtype>> beta_opt) {
+  TORCH_INTERNAL_ASSERT(
+      !(bias && c_ptr),
+      "gemm_and_bias: bias and a distinct C operand are mutually exclusive");
 
   if (std::is_same_v<C_Dtype, float> && std::is_same_v<Dtype, at::BFloat16>) {
     #ifdef USE_ROCM
@@ -1522,7 +1528,8 @@ bool gemm_and_bias(
   }
 
   using opmath_t = at::opmath_type<Dtype>;
-  opmath_t beta_val = bias ? 0 : 1; // bias is added in epilogue unless nullptr
+  // bias is added in epilogue unless nullptr
+  opmath_t beta_val = beta_opt.has_value() ? *beta_opt : (bias ? 0 : 1);
 
   const auto type_info = detail::getCublasLtTypeInfo<Dtype, C_Dtype>();
   const cudaDataType_t abType = type_info.ab_type;
@@ -1606,7 +1613,9 @@ bool gemm_and_bias(
 
   CuBlasLtMatrixLayout Adesc(abType, m, k, mat1_ld, transpose_mat1);
   CuBlasLtMatrixLayout Bdesc(abType, k, n, mat2_ld, transpose_mat2);
-  CuBlasLtMatrixLayout Cdesc(cType, m, n, result_ld);
+  // When c_ptr is null, C aliases D and these two layouts are identical.
+  CuBlasLtMatrixLayout Cdesc(cType, m, n, c_ptr ? c_ld : result_ld);
+  CuBlasLtMatrixLayout Ddesc(cType, m, n, result_ld);
 
   auto ltworkspace = CublasLtWorkspace();
   preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, ltworkspace.size);
@@ -1614,8 +1623,10 @@ bool gemm_and_bias(
 #ifndef USE_ROCM
   uint32_t a_alignment = detail::getAlignment(reinterpret_cast<uintptr_t>(mat1_ptr));
   uint32_t b_alignment = detail::getAlignment(reinterpret_cast<uintptr_t>(mat2_ptr));
-  uint32_t c_alignment = detail::getAlignment(reinterpret_cast<uintptr_t>(result_ptr));
-  uint32_t d_alignment = detail::getAlignment(reinterpret_cast<uintptr_t>(bias));
+  uint32_t c_alignment = detail::getAlignment(reinterpret_cast<uintptr_t>(
+      c_ptr ? static_cast<const void*>(c_ptr) : static_cast<const void*>(result_ptr)));
+  uint32_t d_alignment = detail::getAlignment(reinterpret_cast<uintptr_t>(
+      c_ptr ? static_cast<const void*>(result_ptr) : static_cast<const void*>(bias)));
   preference.setAttribute(CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, a_alignment);
   preference.setAttribute(CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, b_alignment);
   preference.setAttribute(CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, c_alignment);
@@ -1631,7 +1642,7 @@ bool gemm_and_bias(
       Adesc.descriptor(),
       Bdesc.descriptor(),
       Cdesc.descriptor(),
-      Cdesc.descriptor(),
+      Ddesc.descriptor(),
       preference.descriptor(),
       1,
       &heuristicResult,
@@ -1650,10 +1661,10 @@ bool gemm_and_bias(
       mat2_ptr,
       Bdesc.descriptor(),
       beta_ptr,
-      result_ptr,
+      c_ptr ? static_cast<const void*>(c_ptr) : static_cast<const void*>(result_ptr),
       Cdesc.descriptor(),
       result_ptr,
-      Cdesc.descriptor(),
+      Ddesc.descriptor(),
       &heuristicResult.algo,
       ltworkspace.ptr,
       ltworkspace.size,
@@ -1665,7 +1676,7 @@ bool gemm_and_bias(
 #endif
   }
   if (cublasStatus != CUBLAS_STATUS_SUCCESS) {
-    TORCH_WARN(
+    TORCH_WARN_ONCE(
       "gemm_and_bias error: ",
       at::cuda::blas::_cublasGetErrorEnum(cublasStatus),
       " when calling cublasLtMatmul with transpose_mat1 ",
@@ -1712,7 +1723,10 @@ template bool gemm_and_bias(
     const double* bias,
     double* result_ptr,
     int64_t result_ld,
-    GEMMAndBiasActivationEpilogue activation);
+    GEMMAndBiasActivationEpilogue activation,
+    const double* c_ptr,
+    int64_t c_ld,
+    std::optional<at::opmath_type<double>> beta_opt);
 
 template bool gemm_and_bias(
     bool transpose_mat1,
@@ -1728,7 +1742,10 @@ template bool gemm_and_bias(
     const float* bias,
     float* result_ptr,
     int64_t result_ld,
-    GEMMAndBiasActivationEpilogue activation);
+    GEMMAndBiasActivationEpilogue activation,
+    const float* c_ptr,
+    int64_t c_ld,
+    std::optional<at::opmath_type<float>> beta_opt);
 
 template bool gemm_and_bias(
     bool transpose_mat1,
@@ -1744,7 +1761,10 @@ template bool gemm_and_bias(
     const at::Half* bias,
     at::Half* result_ptr,
     int64_t result_ld,
-    GEMMAndBiasActivationEpilogue activation);
+    GEMMAndBiasActivationEpilogue activation,
+    const at::Half* c_ptr,
+    int64_t c_ld,
+    std::optional<at::opmath_type<at::Half>> beta_opt);
 
 template bool gemm_and_bias(
     bool transpose_mat1,
@@ -1760,7 +1780,10 @@ template bool gemm_and_bias(
     const at::Half* bias,
     float* result_ptr,
     int64_t result_ld,
-    GEMMAndBiasActivationEpilogue activation);
+    GEMMAndBiasActivationEpilogue activation,
+    const float* c_ptr,
+    int64_t c_ld,
+    std::optional<at::opmath_type<at::Half>> beta_opt);
 
 template bool gemm_and_bias(
     bool transpose_mat1,
@@ -1776,7 +1799,10 @@ template bool gemm_and_bias(
     const at::BFloat16* bias,
     at::BFloat16* result_ptr,
     int64_t result_ld,
-    GEMMAndBiasActivationEpilogue activation);
+    GEMMAndBiasActivationEpilogue activation,
+    const at::BFloat16* c_ptr,
+    int64_t c_ld,
+    std::optional<at::opmath_type<at::BFloat16>> beta_opt);
 
 template bool gemm_and_bias(
     bool transpose_mat1,
@@ -1792,7 +1818,10 @@ template bool gemm_and_bias(
     const at::BFloat16* bias,
     float* result_ptr,
     int64_t result_ld,
-    GEMMAndBiasActivationEpilogue activation);
+    GEMMAndBiasActivationEpilogue activation,
+    const float* c_ptr,
+    int64_t c_ld,
+    std::optional<at::opmath_type<at::BFloat16>> beta_opt);
 
 using at::blas::ScalingType;
 
